@@ -48,6 +48,58 @@ REPLICATION_FACTOR=3
 * No support for remote journals and fail over
 * No support for clobs/xml and similar large text/blobs
 
+## Table clears and truncate events
+
+The connector can emit a standard Debezium truncate event (`op=t`, null key,
+null `before` and `after`) for these journal entries:
+
+* `F/CR`: a physical file member cleared by `CLRPFM` (also used by some optimized deletes).
+* `D/CG` change field type `8`: SQL `TRUNCATE TABLE`.
+* `D/CG` change field type `3`: an optimized SQL `DELETE FROM` without a `WHERE` clause.
+
+Other `D/CG` subtypes retain the existing schema-refresh behavior. The decoder uses
+the [documented object-level journal layout](https://www.ibm.com/docs/en/ssw_ibm_i_74/rzaki/rzakivarlength.htm),
+including the change field type at relative offset 109, rather than treating all
+file changes as truncates.
+
+Truncate capture is **opt-in**. The inherited `skipped.operations` default is `t`.
+Set `skipped.operations=none`, or a list that does not contain `t`, to enable it.
+
+This initial implementation supports clears **outside commitment control on
+single-member files**. It queries `QSYS2.SYSPARTITIONSTAT` before emitting a clear
+and requires one matching member. The connector does not currently buffer
+transactions, so an enabled clear with a nonzero commit-cycle identifier stops
+the connector through its error handler. It also stops for ambiguous member
+scope, malformed `D/CG` data, or failed truncate dispatch, rather than silently
+acknowledging the clear. Transactional truncates, including rolled-back truncates,
+require transaction buffering and restart-safe replay before they can be supported.
+Auto-commit alone does not guarantee a zero commit-cycle identifier; verify the
+source journal. Do not assume that adding `IMMEDIATE` alone bypasses this guard.
+
+Use one Kafka partition per table topic when consuming truncates: a keyless clear
+has no ordering guarantee relative to keyed row events in other partitions.
+Transforms and sinks must preserve and handle `op=t`; enabling this source feature
+does not enable sink truncate handling. In particular, check any unwrap transform
+and sink configuration before enabling capture. A truncate event is not a series
+of per-key deletes and does not remove earlier keys from Kafka's compacted history.
+Existing stale destination rows still need reconciliation if no subsequent clear
+is applied.
+
+### Testing truncate capture
+
+Run the unit tests with JDK 21 and `./mvnw verify -DskipITs`. The main branch uses
+Debezium snapshot dependencies; build the core modules as described in
+`.github/workflows/maven.yml` first if those artifacts are unavailable.
+
+`As400ConnectorIT.shouldCaptureClearAndThenReload` exercises native `CLRPFM` and
+SQL `TRUNCATE TABLE IMMEDIATE` against the existing dedicated `DTEST.TESTT` test
+fixture, with commitment control disabled. It checks that a keyless truncate is
+followed by the reload insert. These integration tests clear the test table and
+must only run against a disposable IBM i test environment. Before release, also
+validate real journal payloads for optimized deletes, ordinary schema changes,
+member scope, and the commitment-control rejection, then test the complete
+source/transform/sink path and restart behavior on that environment.
+
 # Problems
 
 ## running with a self signed certificate
